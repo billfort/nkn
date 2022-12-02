@@ -34,6 +34,13 @@ func nanoPayKey(sender, recipient string, nonce uint64) nanoPay {
 	return nanoPay{sender, recipient, nonce}
 }
 
+// sync txn
+const MaxSyncTxnInterval = 16000 // in milli seconds
+type TxnWithTime struct {
+	ArriveTime int64
+	Txn        *transaction.Transaction
+}
+
 // TxnPool is a list of txns that need to by add to ledger sent by user.
 type TxnPool struct {
 	TxLists              sync.Map // NonceSortedTxs instance to store user's account.
@@ -46,12 +53,19 @@ type TxnPool struct {
 
 	sync.RWMutex
 	lastDroppedTxn *transaction.Transaction
+
+	// sync txn
+	latSyncTime          int64    // last sync time in second
+	mapTxnWithTime       sync.Map // FIFO txn of last MaxSyncTxnInterval seconds
+	txnWithTimeCount     int      // simple counter of mapTxnWithTie
+	xorHashOfTxnWithTime []byte   // xor of txn hash in txnWithTimeList
 }
 
 func NewTxPool() *TxnPool {
 	tp := &TxnPool{
 		blockValidationState: chain.NewBlockValidationState(),
 		txnCount:             0,
+		xorHashOfTxnWithTime: make([]byte, 32),
 	}
 
 	go func() {
@@ -224,8 +238,13 @@ func (tp *TxnPool) AppendTxnPool(txn *transaction.Transaction) error {
 		return err
 	}
 
+	// sync txn, we trace if this txn is exsit this pool
+	bExist := false
 	if _, err := list.GetByNonce(txn.UnsignedTx.Nonce); err != nil && list.Full() {
 		return errors.New("account txpool full, too many transaction in list")
+	}
+	if err == nil { // this txn is in the pool already.
+		bExist = true
 	}
 
 	// 2. verify txn
@@ -241,6 +260,11 @@ func (tp *TxnPool) AppendTxnPool(txn *transaction.Transaction) error {
 	// 4. process txn
 	if err := tp.processTx(txn); err != nil {
 		return err
+	}
+
+	// 5. sync txn, add to txn with time list
+	if !bExist { // append it into list only when it doesn't exist in the pool before.
+		tp.AppendTxnWithTime(txn)
 	}
 
 	return nil
@@ -609,6 +633,10 @@ func (tp *TxnPool) removeTransactions(txns []*transaction.Transaction) []*transa
 
 func (tp *TxnPool) CleanSubmittedTransactions(txns []*transaction.Transaction) error {
 	txnsRemoved := tp.removeTransactions(txns)
+
+	// sync txn
+	tp.removeFromTxnWithTimeList(txnsRemoved)
+
 	tp.blockValidationState.Lock()
 	defer tp.blockValidationState.Unlock()
 	return tp.CleanBlockValidationState(txnsRemoved)
@@ -677,4 +705,107 @@ func (tp *TxnPool) GetNonceByTxnPool(addr common.Uint160) (uint64, error) {
 
 func shortHashToKey(shortHash []byte) string {
 	return string(shortHash)
+}
+
+// sync txn
+// update xorHashOfTxnWithTime
+func (tp *TxnPool) updateXorHashOfTxnWithTime(txnHash common.Uint256) {
+	byteTxnHash := txnHash.ToArray()
+	if len(tp.xorHashOfTxnWithTime) == 0 {
+		tp.xorHashOfTxnWithTime = byteTxnHash
+	} else {
+		for i := 0; i < len(byteTxnHash); i++ {
+			tp.xorHashOfTxnWithTime[i] ^= byteTxnHash[i]
+		}
+	}
+}
+
+// when append new txn to pool, we add this txn pointer to txtWithTime list too.
+func (tp *TxnPool) AppendTxnWithTime(txn *transaction.Transaction) {
+
+	tp.RemoveTimeoverTxnWithTime()
+
+	now := time.Now().UnixMilli()
+
+	txnWithTime := TxnWithTime{
+		ArriveTime: now,
+		Txn:        txn,
+	}
+	tp.mapTxnWithTime.Store(txn.Hash(), txnWithTime)
+	tp.txnWithTimeCount++
+
+	tp.updateXorHashOfTxnWithTime(txn.Hash())
+
+	return
+
+}
+
+// set txn arrive local time by duration.
+func (tp *TxnPool) SetTxnTime(txnHash common.Uint256, duration int64) {
+	if duration <= 0 {
+		return
+	}
+	v, ok := tp.mapTxnWithTime.Load(txnHash)
+	if !ok {
+		return
+	}
+	txnWithTime, ok := v.(TxnWithTime)
+	if !ok {
+		return
+	}
+	txnWithTime.ArriveTime = time.Now().UnixMilli() - duration
+	tp.mapTxnWithTime.Store(txnHash, txnWithTime)
+}
+
+// romve time over items from txn with time list
+func (tp *TxnPool) RemoveTimeoverTxnWithTime() {
+
+	iNow := time.Now().UnixMilli()
+
+	tp.mapTxnWithTime.Range(func(k, v interface{}) bool {
+		txnWithTime := v.(TxnWithTime)
+		if iNow-txnWithTime.ArriveTime > MaxSyncTxnInterval { // check if it is over time
+			tp.mapTxnWithTime.Delete(k)
+			tp.txnWithTimeCount--
+			txnHash := k.(common.Uint256)
+			tp.updateXorHashOfTxnWithTime(txnHash)
+		}
+		return true
+	})
+
+}
+
+// remove submitted txn from txn with time list
+func (tp *TxnPool) removeFromTxnWithTimeList(txnsRemoved []*transaction.Transaction) {
+	for _, txn := range txnsRemoved {
+		txnHash := txn.Hash()
+		_, ok := tp.mapTxnWithTime.Load(txnHash)
+		if ok {
+			tp.mapTxnWithTime.Delete(txnHash)
+			tp.txnWithTimeCount--
+			tp.updateXorHashOfTxnWithTime(txnHash)
+		}
+	}
+}
+
+// get txn with time list
+func (tp *TxnPool) GetMapTxnWithTime() sync.Map {
+	return tp.mapTxnWithTime
+}
+
+// get xorHashOfTxnTime
+func (tp *TxnPool) GetXorHashAndCount() ([]byte, int) {
+	tp.RemoveTimeoverTxnWithTime()
+
+	return tp.xorHashOfTxnWithTime, tp.txnWithTimeCount
+}
+
+// set last sync time
+func (tp *TxnPool) SetSyncTime() {
+	tp.latSyncTime = time.Now().UnixMilli()
+}
+
+// set last sync time
+func (tp *TxnPool) GetSyncTime() int64 {
+	return tp.latSyncTime
 }

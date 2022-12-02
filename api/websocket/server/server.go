@@ -232,10 +232,10 @@ func (ws *WsServer) registryMethod() {
 
 				return api.RespPacking(nil, errcode.INVALID_SIGNATURE)
 			} else {
-				log.Infof("client auth pass")
+				log.Infof("Client auth pass")
 			}
 		} else {
-			log.Infof("client doesn't send signature, it should be old version sdk")
+			log.Infof("Client doesn't send signature, it should be old version sdk")
 		}
 
 		newSessionID := hex.EncodeToString(clientID)
@@ -336,7 +336,7 @@ func (ws *WsServer) websocketHandler(w http.ResponseWriter, r *http.Request) {
 	// client auth
 	err = ws.sendClientAuthChallenge(sess)
 	if err != nil {
-		log.Error("send client auth challenge: ", err)
+		log.Error("Send client auth challenge: ", err)
 		return
 	}
 
